@@ -48447,10 +48447,12 @@ exports.run = run;
 exports.runTest = runTest;
 exports.replace = replace;
 exports.writeTo = writeTo;
+exports.localCommit = localCommit;
 exports.gitProcessing = gitProcessing;
 exports.createPullRequest = createPullRequest;
 exports.processFile = processFile;
 const js_yaml_1 = __nccwpck_require__(4281);
+const child_process_1 = __nccwpck_require__(5317);
 const fs_1 = __importDefault(__nccwpck_require__(9896));
 const path_1 = __importDefault(__nccwpck_require__(6928));
 const jsonpath_1 = __importDefault(__nccwpck_require__(7989));
@@ -48481,7 +48483,7 @@ async function run(options, actions) {
         if (options.commitChange === false || files.length === 0) {
             return;
         }
-        await gitProcessing(options.repository, options.branch, options.force, options.masterBranchName, files, options.message, octokit, actions, options.committer, options.retries);
+        await gitProcessing(options.repository, options.branch, options.force, options.masterBranchName, files, options.message, octokit, actions, options.committer, localCommit(options.workDir, actions), options.retries);
     }
     catch (error) {
         const msg = error.toString();
@@ -48549,7 +48551,21 @@ function writeTo(content, filePath, actions) {
 }
 const sleep = async (ms) => new Promise(resolve => setTimeout(resolve, ms));
 const normalizePath = (file) => file.replace(/^\.\//, '');
-async function gitProcessing(repository, branch, force, masterBranchName, files, commitMessage, octokit, actions, committer, retries = 0, wait = sleep) {
+// The commit the local files were read from, or '' if workDir is not a git checkout
+function localCommit(workDir, actions) {
+    try {
+        return (0, child_process_1.execFileSync)('git', ['rev-parse', 'HEAD'], {
+            cwd: path_1.default.join(process.cwd(), workDir),
+            encoding: 'utf8',
+            stdio: ['ignore', 'pipe', 'ignore']
+        }).trim();
+    }
+    catch (error) {
+        actions.debug(`could not resolve the local commit: ${error}`);
+        return '';
+    }
+}
+async function gitProcessing(repository, branch, force, masterBranchName, files, commitMessage, octokit, actions, committer, localCommitSha = '', retries = 0, wait = sleep) {
     const { owner, repo } = (0, git_commands_1.repositoryInformation)(repository);
     const debugFiles = {};
     for (const file of files) {
@@ -48557,31 +48573,35 @@ async function gitProcessing(repository, branch, force, masterBranchName, files,
         debugFiles[file.relativePath] = file.sha;
     }
     actions.debug(JSON.stringify(debugFiles));
-    let initialCommitSha = '';
+    // Our file contents are based on this commit. Without a local checkout, fall back
+    // to the branch head we read first
+    let initialCommitSha = localCommitSha;
     for (let attempt = 0;; attempt++) {
         const { commitSha, treeSha } = await (0, git_commands_1.currentCommit)(octokit, owner, repo, branch, masterBranchName);
         actions.debug(JSON.stringify({ baseCommit: commitSha, baseTree: treeSha }));
         if (!initialCommitSha) {
             initialCommitSha = commitSha;
         }
-        else if (initialCommitSha !== commitSha) {
-            // Our file contents were computed from the original base, so only rebase
-            // them onto commits that left those files untouched
+        if (initialCommitSha !== commitSha) {
+            // Only commit our file contents on top of commits that left those files untouched
             const changed = await (0, git_commands_1.changedPaths)(octokit, owner, repo, initialCommitSha, commitSha);
             const conflicts = files
                 .map(file => normalizePath(file.relativePath))
-                .filter(file => changed.includes(file));
+                .filter(file => changed.paths.includes(file));
             if (conflicts.length > 0) {
-                throw new Error(`branch ${branch} was updated concurrently with changes to ${conflicts.join(', ')}, not retrying to avoid overwriting them`);
+                throw new Error(`branch ${branch} was updated with changes to ${conflicts.join(', ')} since ${initialCommitSha}, not committing to avoid overwriting them`);
+            }
+            if (!changed.complete) {
+                throw new Error(`branch ${branch} was updated with too many changes since ${initialCommitSha} to check them for conflicts, not committing to avoid overwriting them`);
             }
         }
         const newTreeSha = await (0, git_commands_1.createNewTree)(octokit, owner, repo, files, treeSha);
         actions.debug(JSON.stringify({ createdTree: newTreeSha }));
         const newCommitSha = await (0, git_commands_1.createNewCommit)(octokit, owner, repo, commitMessage, newTreeSha, commitSha, committer);
         actions.debug(JSON.stringify({ createdCommit: newCommitSha }));
-        actions.setOutput('commit', newCommitSha);
         try {
             await (0, git_commands_1.updateBranch)(octokit, owner, repo, branch, force, newCommitSha, actions);
+            actions.setOutput('commit', newCommitSha);
             break;
         }
         catch (error) {
@@ -48810,11 +48830,31 @@ const isNonFastForward = (error) => {
     const { status, message } = error;
     return status === 422 && /not a fast forward/i.test(message || '');
 };
+// The compare API lists at most this many changed files
+const COMPARE_FILES_LIMIT = 300;
 const changedPaths = async (octo, owner, repo, base, head) => {
-    const { data } = await octo.repos.compareCommits({ owner, repo, base, head });
-    return (data.files || []).flatMap(file => file.previous_filename
-        ? [file.filename, file.previous_filename]
-        : [file.filename]);
+    let files;
+    try {
+        const { data } = await octo.repos.compareCommits({
+            owner,
+            repo,
+            base,
+            head
+        });
+        files = data.files || [];
+    }
+    catch (error) {
+        if (error.status === 404) {
+            throw new Error(`commit ${base} of the local checkout was not found in ${owner}/${repo}. Either it was never pushed, or workDir is a checkout of a different repository`);
+        }
+        throw error;
+    }
+    return {
+        paths: files.flatMap(file => file.previous_filename
+            ? [file.filename, file.previous_filename]
+            : [file.filename]),
+        complete: files.length < COMPARE_FILES_LIMIT
+    };
 };
 exports.changedPaths = changedPaths;
 const updateBranch = async (octo, owner, repo, branch, force, commitSha, actions) => {
@@ -48842,7 +48882,7 @@ const updateBranch = async (octo, owner, repo, branch, force, commitSha, actions
             });
         }
         catch (e) {
-            actions.setFailed(`failed to create branch: ${e}`);
+            throw new Error(`failed to create branch: ${e}`);
         }
     }
 };

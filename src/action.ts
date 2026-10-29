@@ -1,4 +1,5 @@
 import { load } from 'js-yaml'
+import { execFileSync } from 'child_process'
 import fs from 'fs'
 import path from 'path'
 import jp from 'jsonpath'
@@ -67,6 +68,7 @@ export async function run(options: Options, actions: Actions): Promise<void> {
       octokit,
       actions,
       options.committer,
+      localCommit(options.workDir, actions),
       options.retries
     )
   } catch (error) {
@@ -177,6 +179,20 @@ const sleep = async (ms: number): Promise<void> =>
 
 const normalizePath = (file: string): string => file.replace(/^\.\//, '')
 
+// The commit the local files were read from, or '' if workDir is not a git checkout
+export function localCommit(workDir: string, actions: Actions): string {
+  try {
+    return execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: path.join(process.cwd(), workDir),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'ignore']
+    }).trim()
+  } catch (error) {
+    actions.debug(`could not resolve the local commit: ${error}`)
+    return ''
+  }
+}
+
 export async function gitProcessing(
   repository: string,
   branch: string,
@@ -187,6 +203,7 @@ export async function gitProcessing(
   octokit: Octokit,
   actions: Actions,
   committer: Committer,
+  localCommitSha = '',
   retries = 0,
   wait: (ms: number) => Promise<void> = sleep
 ): Promise<void> {
@@ -200,7 +217,9 @@ export async function gitProcessing(
 
   actions.debug(JSON.stringify(debugFiles))
 
-  let initialCommitSha = ''
+  // Our file contents are based on this commit. Without a local checkout, fall back
+  // to the branch head we read first
+  let initialCommitSha = localCommitSha
 
   for (let attempt = 0; ; attempt++) {
     const { commitSha, treeSha } = await currentCommit(
@@ -215,9 +234,10 @@ export async function gitProcessing(
 
     if (!initialCommitSha) {
       initialCommitSha = commitSha
-    } else if (initialCommitSha !== commitSha) {
-      // Our file contents were computed from the original base, so only rebase
-      // them onto commits that left those files untouched
+    }
+
+    if (initialCommitSha !== commitSha) {
+      // Only commit our file contents on top of commits that left those files untouched
       const changed = await changedPaths(
         octokit,
         owner,
@@ -227,11 +247,17 @@ export async function gitProcessing(
       )
       const conflicts = files
         .map(file => normalizePath(file.relativePath))
-        .filter(file => changed.includes(file))
+        .filter(file => changed.paths.includes(file))
 
       if (conflicts.length > 0) {
         throw new Error(
-          `branch ${branch} was updated concurrently with changes to ${conflicts.join(', ')}, not retrying to avoid overwriting them`
+          `branch ${branch} was updated with changes to ${conflicts.join(', ')} since ${initialCommitSha}, not committing to avoid overwriting them`
+        )
+      }
+
+      if (!changed.complete) {
+        throw new Error(
+          `branch ${branch} was updated with too many changes since ${initialCommitSha} to check them for conflicts, not committing to avoid overwriting them`
         )
       }
     }
@@ -251,7 +277,6 @@ export async function gitProcessing(
     )
 
     actions.debug(JSON.stringify({ createdCommit: newCommitSha }))
-    actions.setOutput('commit', newCommitSha)
 
     try {
       await updateBranch(
@@ -263,6 +288,7 @@ export async function gitProcessing(
         newCommitSha,
         actions
       )
+      actions.setOutput('commit', newCommitSha)
       break
     } catch (error) {
       if (!(error instanceof NonFastForwardError) || attempt >= retries) {

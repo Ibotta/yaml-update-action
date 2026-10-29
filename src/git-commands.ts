@@ -146,20 +146,43 @@ const isNonFastForward = (error: unknown): boolean => {
   return status === 422 && /not a fast forward/i.test(message || '')
 }
 
+// The compare API lists at most this many changed files
+const COMPARE_FILES_LIMIT = 300
+
 export const changedPaths = async (
   octo: Octokit,
   owner: string,
   repo: string,
   base: string,
   head: string
-): Promise<string[]> => {
-  const { data } = await octo.repos.compareCommits({ owner, repo, base, head })
+): Promise<{ paths: string[]; complete: boolean }> => {
+  let files
+  try {
+    const { data } = await octo.repos.compareCommits({
+      owner,
+      repo,
+      base,
+      head
+    })
+    files = data.files || []
+  } catch (error) {
+    if ((error as { status?: number }).status === 404) {
+      throw new Error(
+        `commit ${base} of the local checkout was not found in ${owner}/${repo}. Either it was never pushed, or workDir is a checkout of a different repository`
+      )
+    }
 
-  return (data.files || []).flatMap(file =>
-    file.previous_filename
-      ? [file.filename, file.previous_filename]
-      : [file.filename]
-  )
+    throw error
+  }
+
+  return {
+    paths: files.flatMap(file =>
+      file.previous_filename
+        ? [file.filename, file.previous_filename]
+        : [file.filename]
+    ),
+    complete: files.length < COMPARE_FILES_LIMIT
+  }
 }
 
 export const updateBranch = async (
@@ -197,7 +220,7 @@ export const updateBranch = async (
         sha: commitSha
       })
     } catch (e) {
-      actions.setFailed(`failed to create branch: ${e}`)
+      throw new Error(`failed to create branch: ${e}`)
     }
   }
 }
