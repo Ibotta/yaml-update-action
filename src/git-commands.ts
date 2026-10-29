@@ -138,6 +138,30 @@ export const createNewCommit = async (
   return data.sha
 }
 
+export class NonFastForwardError extends Error {}
+
+const isNonFastForward = (error: unknown): boolean => {
+  const { status, message } = error as { status?: number; message?: string }
+
+  return status === 422 && /not a fast forward/i.test(message || '')
+}
+
+export const changedPaths = async (
+  octo: Octokit,
+  owner: string,
+  repo: string,
+  base: string,
+  head: string
+): Promise<string[]> => {
+  const { data } = await octo.repos.compareCommits({ owner, repo, base, head })
+
+  return (data.files || []).flatMap(file =>
+    file.previous_filename
+      ? [file.filename, file.previous_filename]
+      : [file.filename]
+  )
+}
+
 export const updateBranch = async (
   octo: Octokit,
   owner: string,
@@ -156,6 +180,11 @@ export const updateBranch = async (
       force
     })
   } catch (error) {
+    // The branch moved since we read it, creating it would fail as well
+    if (!force && isNonFastForward(error)) {
+      throw new NonFastForwardError(`update branch ${branch} failed (${error})`)
+    }
+
     actions.info(
       `update branch ${branch} failed (${error}), fallback to create branch`
     )

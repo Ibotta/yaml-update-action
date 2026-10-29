@@ -48481,7 +48481,7 @@ async function run(options, actions) {
         if (options.commitChange === false || files.length === 0) {
             return;
         }
-        await gitProcessing(options.repository, options.branch, options.force, options.masterBranchName, files, options.message, octokit, actions, options.committer);
+        await gitProcessing(options.repository, options.branch, options.force, options.masterBranchName, files, options.message, octokit, actions, options.committer, options.retries);
     }
     catch (error) {
         const msg = error.toString();
@@ -48547,22 +48547,52 @@ function writeTo(content, filePath, actions) {
         actions.warning(err.message);
     });
 }
-async function gitProcessing(repository, branch, force, masterBranchName, files, commitMessage, octokit, actions, committer) {
+const sleep = async (ms) => new Promise(resolve => setTimeout(resolve, ms));
+const normalizePath = (file) => file.replace(/^\.\//, '');
+async function gitProcessing(repository, branch, force, masterBranchName, files, commitMessage, octokit, actions, committer, retries = 0, wait = sleep) {
     const { owner, repo } = (0, git_commands_1.repositoryInformation)(repository);
-    const { commitSha, treeSha } = await (0, git_commands_1.currentCommit)(octokit, owner, repo, branch, masterBranchName);
-    actions.debug(JSON.stringify({ baseCommit: commitSha, baseTree: treeSha }));
     const debugFiles = {};
     for (const file of files) {
         file.sha = await (0, git_commands_1.createBlobForFile)(octokit, owner, repo, file);
         debugFiles[file.relativePath] = file.sha;
     }
     actions.debug(JSON.stringify(debugFiles));
-    const newTreeSha = await (0, git_commands_1.createNewTree)(octokit, owner, repo, files, treeSha);
-    actions.debug(JSON.stringify({ createdTree: newTreeSha }));
-    const newCommitSha = await (0, git_commands_1.createNewCommit)(octokit, owner, repo, commitMessage, newTreeSha, commitSha, committer);
-    actions.debug(JSON.stringify({ createdCommit: newCommitSha }));
-    actions.setOutput('commit', newCommitSha);
-    await (0, git_commands_1.updateBranch)(octokit, owner, repo, branch, force, newCommitSha, actions);
+    let initialCommitSha = '';
+    for (let attempt = 0;; attempt++) {
+        const { commitSha, treeSha } = await (0, git_commands_1.currentCommit)(octokit, owner, repo, branch, masterBranchName);
+        actions.debug(JSON.stringify({ baseCommit: commitSha, baseTree: treeSha }));
+        if (!initialCommitSha) {
+            initialCommitSha = commitSha;
+        }
+        else if (initialCommitSha !== commitSha) {
+            // Our file contents were computed from the original base, so only rebase
+            // them onto commits that left those files untouched
+            const changed = await (0, git_commands_1.changedPaths)(octokit, owner, repo, initialCommitSha, commitSha);
+            const conflicts = files
+                .map(file => normalizePath(file.relativePath))
+                .filter(file => changed.includes(file));
+            if (conflicts.length > 0) {
+                throw new Error(`branch ${branch} was updated concurrently with changes to ${conflicts.join(', ')}, not retrying to avoid overwriting them`);
+            }
+        }
+        const newTreeSha = await (0, git_commands_1.createNewTree)(octokit, owner, repo, files, treeSha);
+        actions.debug(JSON.stringify({ createdTree: newTreeSha }));
+        const newCommitSha = await (0, git_commands_1.createNewCommit)(octokit, owner, repo, commitMessage, newTreeSha, commitSha, committer);
+        actions.debug(JSON.stringify({ createdCommit: newCommitSha }));
+        actions.setOutput('commit', newCommitSha);
+        try {
+            await (0, git_commands_1.updateBranch)(octokit, owner, repo, branch, force, newCommitSha, actions);
+            break;
+        }
+        catch (error) {
+            if (!(error instanceof git_commands_1.NonFastForwardError) || attempt >= retries) {
+                throw error;
+            }
+            const delay = Math.floor(1000 + Math.random() * 4000);
+            actions.info(`branch ${branch} was updated concurrently, retrying in ${delay}ms (attempt ${attempt + 2}/${retries + 1})`);
+            await wait(delay);
+        }
+    }
     actions.debug(`Complete`);
 }
 async function createPullRequest(repository, branch, targetBranch, labels, title, description, reviewers, teamReviewers, assignees, octokit, actions) {
@@ -48686,7 +48716,7 @@ const determineFinalFormat = (filePath, format, action) => {
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
-exports.updateBranch = exports.createNewCommit = exports.createNewTree = exports.createBlobForFile = exports.currentCommit = void 0;
+exports.updateBranch = exports.changedPaths = exports.NonFastForwardError = exports.createNewCommit = exports.createNewTree = exports.createBlobForFile = exports.currentCommit = void 0;
 exports.repositoryInformation = repositoryInformation;
 const currentCommit = async (octo, org, repo, branch, masterBranchName) => {
     let commitSha = '';
@@ -48773,6 +48803,20 @@ const createNewCommit = async (octo, owner, repo, message, treeSha, commitSha, a
     return data.sha;
 };
 exports.createNewCommit = createNewCommit;
+class NonFastForwardError extends Error {
+}
+exports.NonFastForwardError = NonFastForwardError;
+const isNonFastForward = (error) => {
+    const { status, message } = error;
+    return status === 422 && /not a fast forward/i.test(message || '');
+};
+const changedPaths = async (octo, owner, repo, base, head) => {
+    const { data } = await octo.repos.compareCommits({ owner, repo, base, head });
+    return (data.files || []).flatMap(file => file.previous_filename
+        ? [file.filename, file.previous_filename]
+        : [file.filename]);
+};
+exports.changedPaths = changedPaths;
 const updateBranch = async (octo, owner, repo, branch, force, commitSha, actions) => {
     try {
         await octo.git.updateRef({
@@ -48784,6 +48828,10 @@ const updateBranch = async (octo, owner, repo, branch, force, commitSha, actions
         });
     }
     catch (error) {
+        // The branch moved since we read it, creating it would fail as well
+        if (!force && isNonFastForward(error)) {
+            throw new NonFastForwardError(`update branch ${branch} failed (${error})`);
+        }
         actions.info(`update branch ${branch} failed (${error}), fallback to create branch`);
         try {
             await octo.git.createRef({
@@ -49040,6 +49088,9 @@ class GitHubOptions {
     get force() {
         return core.getBooleanInput('force');
     }
+    get retries() {
+        return parseInt(core.getInput('retries') || '0', 10) || 0;
+    }
     get commitChange() {
         return core.getBooleanInput('commitChange');
     }
@@ -49184,6 +49235,9 @@ class EnvOptions {
     }
     get force() {
         return process.env.FORCE === 'true';
+    }
+    get retries() {
+        return parseInt(process.env.RETRIES || '0', 10) || 0;
     }
     get commitChange() {
         return process.env.COMMIT_CHANGE === 'true';

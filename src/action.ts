@@ -12,7 +12,9 @@ import {
   createNewTree,
   currentCommit,
   repositoryInformation,
-  updateBranch
+  updateBranch,
+  changedPaths,
+  NonFastForwardError
 } from './git-commands'
 import {
   ChangedFile,
@@ -64,7 +66,8 @@ export async function run(options: Options, actions: Actions): Promise<void> {
       options.message,
       octokit,
       actions,
-      options.committer
+      options.committer,
+      options.retries
     )
   } catch (error) {
     const msg = (error as Error).toString()
@@ -169,6 +172,11 @@ export function writeTo(
   })
 }
 
+const sleep = async (ms: number): Promise<void> =>
+  new Promise(resolve => setTimeout(resolve, ms))
+
+const normalizePath = (file: string): string => file.replace(/^\.\//, '')
+
 export async function gitProcessing(
   repository: string,
   branch: string,
@@ -178,18 +186,11 @@ export async function gitProcessing(
   commitMessage: string,
   octokit: Octokit,
   actions: Actions,
-  committer: Committer
+  committer: Committer,
+  retries = 0,
+  wait: (ms: number) => Promise<void> = sleep
 ): Promise<void> {
   const { owner, repo } = repositoryInformation(repository)
-  const { commitSha, treeSha } = await currentCommit(
-    octokit,
-    owner,
-    repo,
-    branch,
-    masterBranchName
-  )
-
-  actions.debug(JSON.stringify({ baseCommit: commitSha, baseTree: treeSha }))
   const debugFiles: { [file: string]: string } = {}
 
   for (const file of files) {
@@ -199,24 +200,82 @@ export async function gitProcessing(
 
   actions.debug(JSON.stringify(debugFiles))
 
-  const newTreeSha = await createNewTree(octokit, owner, repo, files, treeSha)
+  let initialCommitSha = ''
 
-  actions.debug(JSON.stringify({ createdTree: newTreeSha }))
+  for (let attempt = 0; ; attempt++) {
+    const { commitSha, treeSha } = await currentCommit(
+      octokit,
+      owner,
+      repo,
+      branch,
+      masterBranchName
+    )
 
-  const newCommitSha = await createNewCommit(
-    octokit,
-    owner,
-    repo,
-    commitMessage,
-    newTreeSha,
-    commitSha,
-    committer
-  )
+    actions.debug(JSON.stringify({ baseCommit: commitSha, baseTree: treeSha }))
 
-  actions.debug(JSON.stringify({ createdCommit: newCommitSha }))
-  actions.setOutput('commit', newCommitSha)
+    if (!initialCommitSha) {
+      initialCommitSha = commitSha
+    } else if (initialCommitSha !== commitSha) {
+      // Our file contents were computed from the original base, so only rebase
+      // them onto commits that left those files untouched
+      const changed = await changedPaths(
+        octokit,
+        owner,
+        repo,
+        initialCommitSha,
+        commitSha
+      )
+      const conflicts = files
+        .map(file => normalizePath(file.relativePath))
+        .filter(file => changed.includes(file))
 
-  await updateBranch(octokit, owner, repo, branch, force, newCommitSha, actions)
+      if (conflicts.length > 0) {
+        throw new Error(
+          `branch ${branch} was updated concurrently with changes to ${conflicts.join(', ')}, not retrying to avoid overwriting them`
+        )
+      }
+    }
+
+    const newTreeSha = await createNewTree(octokit, owner, repo, files, treeSha)
+
+    actions.debug(JSON.stringify({ createdTree: newTreeSha }))
+
+    const newCommitSha = await createNewCommit(
+      octokit,
+      owner,
+      repo,
+      commitMessage,
+      newTreeSha,
+      commitSha,
+      committer
+    )
+
+    actions.debug(JSON.stringify({ createdCommit: newCommitSha }))
+    actions.setOutput('commit', newCommitSha)
+
+    try {
+      await updateBranch(
+        octokit,
+        owner,
+        repo,
+        branch,
+        force,
+        newCommitSha,
+        actions
+      )
+      break
+    } catch (error) {
+      if (!(error instanceof NonFastForwardError) || attempt >= retries) {
+        throw error
+      }
+
+      const delay = Math.floor(1000 + Math.random() * 4000)
+      actions.info(
+        `branch ${branch} was updated concurrently, retrying in ${delay}ms (attempt ${attempt + 2}/${retries + 1})`
+      )
+      await wait(delay)
+    }
+  }
 
   actions.debug(`Complete`)
 }
